@@ -3,19 +3,58 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <regex>
 #include <Windows.h>
-#include <unordered_set>
+#include <vector>
+#include <map>
 
-std::string ReplaceSubstring(std::string string, std::string substring, std::string replaceWith)
+std::string GetGuidFromMeta(const std::string& path)
 {
-    return std::regex_replace(string, std::regex(substring), replaceWith);
+    std::ifstream fileStream(path);
+    std::string content((std::istreambuf_iterator<char>(fileStream)), std::istreambuf_iterator<char>());
+    fileStream.close();
+
+    int guidIndex = content.find("guid: ");
+    if (guidIndex == std::string::npos)
+        return "";
+
+    return content.substr(guidIndex + 6, 32);
+}
+
+void ChangeMetaGuid(const std::string& metaPath, const std::string newGuid)
+{
+    std::ifstream fileStream(metaPath);
+    std::string content((std::istreambuf_iterator<char>(fileStream)), std::istreambuf_iterator<char>());
+    fileStream.close();
+
+    int guidIndex = content.find("guid: ");
+    if (guidIndex == std::string::npos)
+        return;
+
+    guidIndex += 6;
+
+    std::fstream outputStream(metaPath, std::ios::in | std::ios::out);
+    outputStream.seekp(guidIndex);
+    outputStream << newGuid;
+    outputStream.close();
+}
+
+bool ends_with(const std::string &str, const std::string &suffix)
+{
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 int main(int argc, char* argv[])
 {
-    if (argc != 4) {
-        std::cout << "Usage: ReplaceGUIDwithCorrectOne <IncorrectGUIDsPath> <CorrectGUIDsPath> <UnityProjectPath>\n";
+    #ifdef LOG
+    std::fstream out("log.txt", std::ios::out);
+    #else
+    std::ostream& out = std::cout;
+    #endif
+
+    if (argc != 4)
+    {
+        std::cerr << "Usage: " << argv[0] << " <IncorrectGUIDsPath> <CorrectGUIDsPath> <UnityProjectPath>\n";
         return 1;
     }
 
@@ -27,63 +66,129 @@ int main(int argc, char* argv[])
     std::filesystem::path path2 = CorrectGUIDsPath;
     std::filesystem::path path3 = UnityProjectPath;
 
-    if (!std::filesystem::exists(path1) || !std::filesystem::exists(path2) || !std::filesystem::exists(path3)) {
-        std::cout << "WTH? a path wasn't valid! Double check and try again.\n";
+    if (!std::filesystem::exists(path1) || !std::filesystem::exists(path2) || !std::filesystem::exists(path3))
+    {
+        std::cerr << "One or more paths are invalid. Please double check and try again.\n";
         return 1;
     }
 
-    std::unordered_set<std::string> skipFolders = {
-        "AnimationClip", "AnimatorController", "AnimatorOverrideController", "AudioClip", "AudioMixerController",
-        "Avatar", "AvatarMask", "Cubemap", "Editor", "Material", "Mesh", "PhysicMaterial",
-        "RenderTexture", "Resources", "Shader", "Sprite", "Texture2D", "VideoClip"
-    };
+    out << "Creating GUID map...\n";
+    std::map<std::string, std::string> fileNameToCorrectGuid;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(CorrectGUIDsPath))
+    {
+        if (!ends_with(entry.path().string(), ".cs.meta"))
+            continue;
+        
+        std::string guid = GetGuidFromMeta(entry.path().string());
+        if (guid.length() == 0)
+            continue;
 
-    for (const std::filesystem::directory_entry& entry : std::filesystem::recursive_directory_iterator(IncorrectGUIDsPath)) {
-        if (entry.is_directory() && skipFolders.find(entry.path().filename().string()) != skipFolders.end()) {
+        fileNameToCorrectGuid[entry.path().filename().string()] = guid;
+    }
+    
+    std::map<std::string, std::string> incorrectGuidToCorrectGuid;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::recursive_directory_iterator(IncorrectGUIDsPath))
+    {
+        if (!ends_with(entry.path().string(), ".cs.meta"))
+            continue;
+
+        std::string incorrectGuid = GetGuidFromMeta(entry.path().string());
+        if (incorrectGuid.length() == 0)
+            continue;
+
+        auto correctGuidEntry = fileNameToCorrectGuid.find(entry.path().filename().string());
+        if (correctGuidEntry == fileNameToCorrectGuid.end())
+            continue;
+        
+        incorrectGuidToCorrectGuid[incorrectGuid] = correctGuidEntry->second;
+        out << incorrectGuid << " => " << correctGuidEntry->second << "\n";
+    }
+
+    out << "Fixing files...\n";
+
+    char tempChar;
+    char guidCheck[8];
+    guidCheck[7] = 0;
+    char guid[33];
+    guid[32] = 0;
+
+    for (const auto& ProjectAssetFile : std::filesystem::recursive_directory_iterator(UnityProjectPath))
+    {
+        if (ProjectAssetFile.is_directory())
+            continue;
+        
+        out << "Processing " << ProjectAssetFile.path().string() << "...\n";
+
+        // Special operation for meta files
+        if (ProjectAssetFile.path().extension() == ".meta")
+        {
+            std::string metaGuid = GetGuidFromMeta(ProjectAssetFile.path().string());
+            if (metaGuid.length() == 0)
+                continue;
+            
+            auto correctMetaGuid = incorrectGuidToCorrectGuid.find(metaGuid);
+            if (correctMetaGuid == incorrectGuidToCorrectGuid.end())
+                continue;
+
+            ChangeMetaGuid(ProjectAssetFile.path().string(), correctMetaGuid->second);
             continue;
         }
 
-        if (entry.path().extension() == ".meta") {
-            std::ifstream ifs(entry.path());
-            if (!ifs.is_open()) continue;
+        std::fstream assetStream(ProjectAssetFile.path().string(), std::ios::in | std::ios::out);
+        if (!assetStream.is_open())
+        {
+            out << "   COULD NOT OPEN THE FILE, SKIPPING\n";
+            continue;
+        }
 
-            // Get file contents
-            std::string contentsOfWrongGUID((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
-            std::string incorrectGuid = contentsOfWrongGUID.substr(27, 32);
+        char header[6];
+        header[5] = 0;
 
-            for (const auto& entry2 : std::filesystem::recursive_directory_iterator(CorrectGUIDsPath)) {
-                if (entry2.is_directory() && skipFolders.find(entry2.path().filename().string()) != skipFolders.end()) {
-                    continue;
-                }
+        assetStream.read(header, 5);
+        if (std::string(header) != "%YAML")
+        {
+            out << "   NON SERIALIZED FILE, SKIPPING\n";
+            continue;
+        }
 
-                if (entry2.path().filename() == entry.path().filename()) {
-                    std::ifstream ifs2(entry2.path());
-                    if (!ifs2.is_open()) continue;
+        while (!assetStream.eof())
+        {
+            // Sample object reference: {fileID: 10905, guid: 0000000000000000f000000000000000, type: 0}
 
-                    // Get file contents
-                    std::string contentsOfCorrectGUID((std::istreambuf_iterator<char>(ifs2)), (std::istreambuf_iterator<char>()));
-                    std::string CorrectGuid = contentsOfCorrectGUID.substr(27, 32);
+            // Read until '{'
+            assetStream.read(&tempChar, 1);
+            if (tempChar == '{')
+            {
+                while (!assetStream.eof())
+                {
+                    // Read until comma or end of reference
+                    assetStream.read(&tempChar, 1);
+                    if (tempChar == '}')
+                        break;
 
-                    for (const auto& ProjectAssetFile : std::filesystem::recursive_directory_iterator(UnityProjectPath)) {
-                        if (ProjectAssetFile.is_directory() && skipFolders.find(ProjectAssetFile.path().filename().string()) != skipFolders.end()) {
-                            continue;
+                    if (tempChar == ',')
+                    {
+                        assetStream.read(guidCheck, 7);
+                        if (std::string(guidCheck) == " guid: ")
+                        {
+                            assetStream.read(guid, 32);
+                            std::string currentGuid(guid);
+                            auto correctGuid = incorrectGuidToCorrectGuid.find(currentGuid);
+
+                            if (correctGuid != incorrectGuidToCorrectGuid.end())
+                            {
+                                assetStream.seekg(-32, std::ios::cur);
+                                assetStream << correctGuid->second;
+                            }
                         }
 
-                        std::ifstream _fileToCorrect(ProjectAssetFile.path());
-                        if (!_fileToCorrect.is_open()) continue;
-
-                        std::string fileToCorrectContents((std::istreambuf_iterator<char>(_fileToCorrect)), (std::istreambuf_iterator<char>()));
-                        if (fileToCorrectContents.find(incorrectGuid) != std::string::npos) {
-                            std::ofstream corrected(ProjectAssetFile.path());
-                            if (!corrected.is_open()) continue;
-
-                            corrected << ReplaceSubstring(fileToCorrectContents, incorrectGuid, CorrectGuid) << std::endl;
-                            std::cout << "File " + ProjectAssetFile.path().filename().string() + " has been corrected\n";
-                        }
+                        break;
                     }
                 }
             }
         }
+
+        assetStream.close();
     }
 
     return 0;
