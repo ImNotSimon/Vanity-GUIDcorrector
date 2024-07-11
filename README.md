@@ -1,4 +1,4 @@
-# GUIDcorrector
+# GUIDcorrector (CODE BY ETERNALUNION!)
 
 ## Instructions
 
